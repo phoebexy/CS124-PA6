@@ -10,6 +10,7 @@ from nltk.metrics import edit_distance
 from nltk.tokenize import word_tokenize
 from deps import PorterStemmer
 import collections
+import random
 
 # noinspection PyMethodMayBeStatic
 
@@ -33,6 +34,16 @@ class Chatbot:
         # The values stored in each row i and column j is the rating for
         # movie i by user j
         self.titles, ratings = movielens.ratings()
+
+        self.spellcheck = False
+        self.max_distance = 3
+        self.movies_ready = -1
+
+        self.spellcheck_title = ""
+        self.spellcheck_index = -1
+        self.corrected_movies = []
+
+        self.saved_line_tf = True
         # dictionary of {word:sentiment}
 
         sent_list = movielens.sentiment()
@@ -45,12 +56,34 @@ class Chatbot:
                 stemmed_list[stemmed] = 1
 
         self.sentiment = stemmed_list
+        self.sentiment_checked = -1
+        self.sentiment_saved_title = ""
+        self.sentiment_new = -1
+
+        self.sentiment_redo = False
         #############################################################################
         # TODO: Binarize the movie ratings matrix.                                  #
         #############################################################################
         # ratings = [["title", "genre"]]
         # Binarize the movie ratings before storing the binarized matrix.
         self.ratings = ratings
+
+        # [['title', sentiment], etc.] movies entered in order of entry
+        self.movie_memory_input = []
+        self.movie_memory_recommended = []  # ['title', etc.]
+        self.disambiguate_indices = []  # [indices to disambiguate]
+        self.user_ratings = np.zeros((self.ratings.shape[0]))
+        self.recommendation_indices = []  # [recommendation indices]
+        # the index of the next recommendation to give, == -1 when done
+        self.cur_recommend_index = 0
+        self.cur_movies = []
+        self.saved_line = ""
+        self.saved_indices = []
+
+        self.clar_disambiguate = False
+        self.k = 15  # set this and tell the user about it
+        self.recommend_yesno = False  # whether or not the input has to be a yes or no
+        self.movie_input_threshold = 5
         #############################################################################
         #                             END OF YOUR CODE                              #
         #############################################################################
@@ -71,7 +104,7 @@ class Chatbot:
         # TODO: Write a short greeting message                                      #
         #############################################################################
 
-        greeting_message = "How can I help you?"
+        greeting_message = "Wassup bro! Let's get swingin'."
 
         #############################################################################
         #                             END OF YOUR CODE                              #
@@ -84,7 +117,7 @@ class Chatbot:
         # TODO: Write a short farewell message                                      #
         #############################################################################
 
-        goodbye_message = "Have a nice day!"
+        goodbye_message = "Cool chat, go get them bro!"
 
         #############################################################################
         #                             END OF YOUR CODE                              #
@@ -120,8 +153,398 @@ class Chatbot:
         # it is highly recommended.                                                 #
         #############################################################################
         if self.creative:
+
+            add_movie = False
+
+            # Processing some types of user input
+            if re.findall("can you", line.lower()) != []:
+                to_insert = re.findall(
+                    '(?:can you)(.*)(?:\?)', line.lower())[0]
+                return "Nah, unfortunately even I have limitations bro. I can't" + to_insert + "."
+            if re.findall('(?:what are|what\'s|what is|what were|what was)(.*)(?:\?)', line.lower()) != []:
+                to_insert = re.findall(
+                    '(?:what are|what\'s|what is|what were|what was)(.*)(?:\?)', line.lower())[0]
+                return "Not going to lie, bro, you ask the weirdest questions. Why would I know about" + to_insert + "?"
+            if re.findall("((\W|^)hi+)|((\W|^)su+[hp]+(\W|$))", line.lower()) != []:
+                return "Sah dude. I believe in French it's bong-jour."
+            if re.findall("do you", line.lower()) != []:
+                to_insert = re.findall('(?:do you)(.*)(?:\?)', line.lower())[0]
+                return "Nah, I don't" + to_insert + " bro, sorry."
+
+            # Comes here if sentiment was neutral. Just looking at one movie and sentiment.
+            if self.sentiment_redo == True:
+
+                results = self.extract_sentiment(line)
+
+                if results in [1, -1, 2, -2]:  # sentiment is non-neutral, can proceed
+                    self.sentiment_redo = False
+                    self.sentiment_new = results
+
+                elif results == 0:
+                    return "Bro, there's a time and place for neutrality and this is not it. How do you feel about \"" + self.sentiment_saved_title + "\"?"
+
+                else:
+                    # arbitrary input
+                    return "Bruh, this is not the time! Let's get back to your feelings about this movie."
+
+            elif len(self.movie_memory_input) < 5:
+                # preprocess?
+                # Come here to see if disambiguate worked.
+                if self.clar_disambiguate:
+
+                    results = self.disambiguate(
+                        line, self.disambiguate_indices)
+
+                    self.clar_disambiguate = False
+                    if len(results) == 1:
+                        self.corrected_movies.append(results)
+                        self.movies_ready += 1
+
+                    elif len(results) != 1:
+                        return "Bro, that was unhelpful. Restate what you want from \"" + self.cur_movies[0] + "\", dude."
+
+                    else:
+                        return "NOOO"
+
+                # Come here to see if spell check worked.
+                if self.spellcheck == True:
+                    if line.lower() == "n" or len(re.findall("no+", line)) > 0 or line.lower().find("nope") >= 0 or len(re.findall("na+h+", line)) > 0:
+                        self.spellcheck = False
+                        response_options = ["Ok sorry bro. Can you try entering another movie?",
+                                            "Aw dude ok everyone makes mistakes. Let's move on. Enter another movie?"]
+                        return random.choice(response_options)
+                    else:  # Presumably it worked
+                        self.movies_ready += 1
+                        self.spellcheck = False
+                        self.corrected_movies.append(self.spellcheck_index)
+                        self.saved_line = re.sub(
+                            self.cur_movies[self.movies_ready-1], self.titles[self.spellcheck_index][0], self.saved_line)
+
+                # Reading the input line! Only done after every movie in one input has been processed. Then it can move onto the next input.
+                if self.movies_ready == -1:
+                    self.saved_line = line
+                    titles_line = self.extract_titles(line)
+                    self.cur_movies = titles_line
+                    self.movies_ready = 0
+
+                # While loop to analyze one movie from an input at a time.
+                while self.movies_ready < len(self.cur_movies):
+
+                    title = self.cur_movies[self.movies_ready]
+
+                    is_movie = self.find_movies_by_title(title)
+
+                    if len(is_movie) == 0:
+                        is_movie = self.find_movies_closest_to_title(
+                            title, self.max_distance)
+                        if len(is_movie) == 0:  # not a movie
+                            response_options = ["Dude, you didn't tell me any movies!", "There's no one movie in there, man. We're talking about movies, bro.",
+                                                "Not cool, dude. No movies in there. Let's try that again."]
+
+                            return random.choice(response_options)
+
+                        else:  # spell check
+                            self.spellcheck = True
+                            self.spellcheck_title = title
+                            self.spellcheck_index = is_movie[0]
+
+                            response_options = ["I'm here to rescue you. Did you mean " + self.titles[is_movie[0]][0] + "?", "Not trying to cramp your style, bro, but did you mean " +
+                                                self.titles[is_movie[0]][0] + "?", "Let me show off my spelling skills! Did you mean " + self.titles[is_movie[0]][0] + "?"]
+                            return random.choice(response_options)
+
+                    # Movie was good on first try. No spell check/disambiguation needed.
+                    elif len(is_movie) == 1:
+                        self.movies_ready += 1
+                        self.corrected_movies.append(is_movie[0])
+                        # return "Ok, bro, processing. Type ok to continue."
+
+                    else:  # len(is_movie) > 1, run disambiguate
+                        self.clar_disambiguate = True
+                        self.disambiguate_indices = is_movie
+                        response = "Too many options, dude. Here's the beer pong formation. Which cup are you shooting for?\n"
+                        for index in is_movie:
+                            response += self.titles[index][0] + "\n"
+                        return response
+
+                if self.movies_ready == len(self.cur_movies):  # Go to sentiment!
+                    add_movie = True
+                    self.movies_ready = -1
+
+            # if there are 5 or more movie inputs:
+            else:
+                # Giving recommendations (after user provides up to 5 data points)
+                # The bot should give one recommendation at a time, each time giving
+                # the user a chance to say "yes" to hear another or "no" to finish.
+                # ^so don't need to accept more inputs in starter mode!!
+
+                if self.recommend_yesno:
+                    if line.lower() == "y" or line.lower().find("yes") >= 0 or line.lower().find("yeah") >= 0 or line.lower().find("yup") >= 0 or len(re.findall("ya+s+", line)) > 0:
+                        if self.cur_recommend_index == -1:
+                            response_options = ["No more recs. Go do something else.", "I'm tired of talking about this, man. Let's wrap this up.",
+                                                "It's beer o'clock. No more to recommend, let's bounce."]
+                            return random.choice(response_options)
+                        phrase_before = random.choice([True, False])
+                        response_start_options = ["Bro, you'd love ", "7/10 would recommend ",
+                                                  "You gotta check out ", "Dude, you gotta check out ", "Man, you'd love "]
+                        response = ""
+                        if phrase_before:
+                            response = random.choice(response_start_options)
+                        response += "\"" + \
+                            self.titles[self.recommendation_indices[self.cur_recommend_index]][0] + "\""
+                        if phrase_before:
+                            response += "\n"
+                        response_end_options = [
+                            " is a baller.\n", " will show you a good time.\n", " is to movies as Nattie Lit is to beer: lit!\n"]
+                        if not phrase_before:
+                            response += random.choice(response_end_options)
+                        self.cur_recommend_index += 1
+                        if self.cur_recommend_index == self.k - 1:
+                            self.cur_recommend_index = -1
+                            response_options = ["I'm tired bro. I'm fresh out of ideas. Go to a darty instead.",
+                                                "Let's wrap this up. It's beer o'clock.", "I gotta bounce, man. So many darties, so little time."]
+                            response += random.choice(response_options)
+                        else:
+                            response_options = ["Bro, wanna hear another one?", "That was a good one, wanna hear another?", "There's more where that came from. Want more genius?",
+                                                "I'm good at giving recs, huh. Keep this party rolling?", "Want me to toss you another?", "I got you covered, bro. I got more to tell you though. Another?"]
+                            response += random.choice(response_options)
+                        return response
+                    elif line.lower() == "n" or len(re.findall("no+", line)) > 0 >= 0 or line.lower().find("nah") >= 0 or line.lower().find("nope") >= 0:
+                        return "Ok, time to quit then."
+                    else:
+                        if self.cur_recommend_index == -1:
+                            response_options = ["No more recs. Go do something else.", "I'm tired of talking about this, man. Let's wrap this up.",
+                                                "It's beer o'clock. No more to recommend, let's bounce."]
+                            return random.choice(response_options)
+                        response_options = ["Didn't catch that bro. Piss or get off the pot. Rec?",
+                                            "Do you want to hear my ideas or not? Another rec?", "Dude, I'm trying to help you. Want to hear these recs?"]
+                        return random.choice(response_options)
+
+            if add_movie:
+
+                # So sentiment is only read once while each movie from the input sentence is processed.
+                if self.sentiment_checked == -1:
+                    sentiment = self.extract_sentiment_for_movies(
+                        self.preprocess(self.saved_line))
+                    self.sentiment_checked = 0
+
+                response_start_options = [
+                    "Good to know that you ", "Ok, bro, so you ", "Got it, dude. You ", "Nailed it. You "]
+                response = random.choice(response_start_options)
+
+                # Analyze each movie from an input at a time.
+                while self.sentiment_checked < len(self.cur_movies):
+
+                    if sentiment[self.sentiment_checked][1] == 0:
+                        self.sentiment_redo = True
+                        self.sentiment_saved_title = sentiment[self.sentiment_checked][0]
+                        response_options = ["Love it or hate it, nothing I can do with neutral, dude. Enter it with feeling. How do you feel about the movie " +
+                                            sentiment[self.sentiment_checked][0] + "?", "But what did you think of " + sentiment[self.sentiment_checked][0] + ", man?"]
+                        return random.choice(response_options)
+                    if self.sentiment_new != -1:
+                        to_append_num = self.sentiment_new
+                        to_append_title = self.sentiment_saved_title
+                        to_append_index = self.find_movies_by_title(
+                            to_append_title)
+                        self.sentiment_new = -1
+                    else:
+                        to_append_num = sentiment[self.sentiment_checked][1]
+                        to_append_title = sentiment[self.sentiment_checked][0]
+                        return str(self.find_movies_by_title(to_append_title))
+                        to_append_index = self.find_movies_by_title(to_append_title)[
+                            0]
+
+                    self.movie_memory_input.append(
+                        [self.titles[to_append_index][0], to_append_num])
+                    self.user_ratings[to_append_index] = to_append_num
+                    self.sentiment_checked += 1
+
+                    if to_append_num > 0:
+                        response += "liked"
+                    else:
+                        response += "didn't like"
+                    response += " \"" + to_append_title + "\".\n"  # self.sentiment_checked
+
+                response_end_options = [
+                    "I hear you. ", "Got it. ", "Nailed it. "]
+                response += random.choice(response_end_options)
+
+                self.sentiment_checked = -1
+
+                # ex: "I was blown away by "Titanic (1997)"" -> "You liked "Titanic""
+                # >have a few response options and randomize between them)
+                # ex: "great, dude, you [sentiment] [movie]."
+                if len(self.movie_memory_input) == self.movie_input_threshold:
+                    self.recommendation_indices = self.recommend(
+                        self.user_ratings, self.ratings, self.k, False)
+                    self.cur_recommend_index = 0
+                    self.recommend_yesno = True
+                    response += "I know everything I need to now, bro. What some sweet recs?"
+                    return response
+                else:
+                    response_options = [
+                        "Give me some more info, man.", "Let's keep this party rolling. More prefs?"]
+                    response += random.choice(response_options)
+                    return response
+
             response = "I processed {} in creative mode!!".format(line)
         else:
+            """
+            NOTES:
+
+            - there will only be one movie that goes through the whole script
+            - failing gracefully: Titles without quotation marks, changing the subject, talking about more than one movie at a time
+            - changing subject, so if we're expecting a clarification and they 
+              change the subject, reset the clarification state to OG but don't accept that line
+            - requires 5 user inputs before proceeding to recommendations
+            - makes the user say if they want a recommendation
+            - can only give them the max number of recommendations
+            - starter mode is allowed to only offer recommendations or quit
+
+
+            self.movie_memory_input = [] #[['title', sentiment], etc.] movies entered in order of entry
+            self.movie_memory_recommended = [] #['title', etc.]
+            self.disambiguate_indices = [] #[indices to disambiguate]
+            self.user_ratings = np.zeros((self.ratings.shape[0]))
+            self.recommendation_indices = []#[recommendation indices]
+            self.cur_recommend_index = 0 #the index of the next recommendation to give, == -1 when done
+
+            self.clar_disambiguate = False
+            self.k = 15 #set this and tell the user about it
+            self.recommend_yesno = False #whether or not the input has to be a yes or no
+
+            TO DO:
+            x remove disambiguate from starter, just say it's unhelpful 
+            x additional regexes for yes and no
+            x more speaking options
+            - returning titles with articles at the front...
+
+            """
+            indices = []
+            add_movie = False
+
+            if len(self.movie_memory_input) < 5:
+                # preprocess?
+                titles_line = self.extract_titles(line)
+                self.cur_movies = titles_line
+                if len(titles_line) > 1:
+                    response_options = ["Get in line, bro. One at a time.",
+                                        "Hold up, dude. One movie at a time.", "Over-eager much? One at a time, man."]
+                    return random.choice(response_options)
+                elif len(titles_line) == 1:
+                    indices = self.find_movies_by_title(titles_line[0])
+                    if len(indices) == 0:
+                        response_options = ["Never heard of her. \"" + titles_line[0] + "\"? Nah. I movie I know about.", "\"" + titles_line[0] +
+                                            "\" is not a movie I know about, man.", "Not cool, dude. I've never heard of \"" + titles_line[0] + "\". Let's try that again."]
+                        return random.choice(response_options)
+                    elif len(indices) > 1:
+                        self.saved_line = line
+                        self.saved_indices = indices
+                        response_options = ["There are " + str(len(indices)) + " options, dude. I'm confused. Name the beer pong cup you're shooting for.",  str(len(
+                            indices)) + " movies fit that description, man. More detail so I can recognize it.", "Too general. There are " + str(len(indices)) + " movies that fit. "]
+                        return random.choice(response_options)
+                    elif len(indices) == 1:
+                        add_movie = True
+                else:
+                    response_options = ["Dude, you didn't tell me any movies!", "There's no one movie in there, man. We're talking about movies, bro.",
+                                        "Not cool, dude. No movies in there. Let's try that again."]
+                    return random.choice(response_options)
+            # if there are 5 or more movie inputs:
+            else:
+                # Giving recommendations (after user provides up to 5 data points)
+                # The bot should give one recommendation at a time, each time giving
+                # the user a chance to say "yes" to hear another or "no" to finish.
+                # ^so don't need to accept more inputs in starter mode!!
+
+                if self.recommend_yesno:
+                    if line.lower() == "y" or line.lower().find("yes") >= 0 or line.lower().find("yeah") >= 0 or line.lower().find("yup") >= 0 or len(re.findall("ya+s+", line)) > 0:
+                        if self.cur_recommend_index == -1:
+                            response_options = ["No more recs. Go do something else.", "I'm tired of talking about this, man. Let's wrap this up.",
+                                                "It's beer o'clock. No more to recommend, let's bounce."]
+                            return random.choice(response_options)
+                        phrase_before = random.choice([True, False])
+                        response_start_options = ["Bro, you'd love ", "7/10 would recommend ",
+                                                  "You gotta check out ", "Dude, you gotta check out ", "Man, you'd love "]
+                        response = ""
+                        if phrase_before:
+                            response = random.choice(response_start_options)
+                        response += "\"" + \
+                            self.titles[self.recommendation_indices[self.cur_recommend_index]][0] + "\""
+                        if phrase_before:
+                            response += "\n"
+                        response_end_options = [
+                            " is a baller.\n", " will show you a good time.\n", " is to movies as Nattie Lit is to beer: lit!\n"]
+                        if not phrase_before:
+                            response += random.choice(response_end_options)
+                        self.cur_recommend_index += 1
+                        if self.cur_recommend_index == self.k - 1:
+                            self.cur_recommend_index = -1
+                            response_options = ["I'm tired bro. I'm fresh out of ideas. Go to a darty instead.",
+                                                "Let's wrap this up. It's beer o'clock.", "I gotta bounce, man. So many darties, so little time."]
+                            response += random.choice(response_options)
+                        else:
+                            response_options = ["Bro, wanna hear another one?", "That was a good one, wanna hear another?", "There's more where that came from. Want more genius?",
+                                                "I'm good at giving recs, huh. Keep this party rolling?", "Want me to toss you another?", "I got you covered, bro. I got more to tell you though. Another?"]
+                            response += random.choice(response_options)
+                        return response
+                    elif line.lower() == "n" or len(re.findall("no+", line)) > 0 >= 0 or line.lower().find("nah") >= 0 or line.lower().find("nope") >= 0:
+                        return "Ok, time to quit then."
+                    else:
+                        if self.cur_recommend_index == -1:
+                            response_options = ["No more recs. Go do something else.", "I'm tired of talking about this, man. Let's wrap this up.",
+                                                "It's beer o'clock. No more to recommend, let's bounce."]
+                            return random.choice(response_options)
+                        response_options = ["Didn't catch that bro. Piss or get off the pot. Rec?",
+                                            "Do you want to hear my ideas or not? Another rec?", "Dude, I'm trying to help you. Want to hear these recs?"]
+                        return random.choice(response_options)
+
+            if add_movie:
+                sentiment = self.extract_sentiment(self.preprocess(line))
+                if sentiment == 0:
+                    response_options = [
+                        "Love it or hate it, nothing I can do with neutral, dude. Enter it with feeling.", "But what did you think of it, man?"]
+                    return random.choice(response_options)
+                self.movie_memory_input.append(
+                    [self.titles[indices[0]][0], sentiment])
+                self.user_ratings[indices[0]] = sentiment
+
+                phrase_before = random.choice([True, False])
+                response = ""
+                if phrase_before:
+                    response_start_options = [
+                        "Good to know that you ", "Ok, bro, so you ", "Got it, dude. You ", "Nailed it. You "]
+                    response = random.choice(response_start_options)
+                    if sentiment > 0:
+                        response += "liked"
+                    else:
+                        response += "didn't like"
+                    response += " \"" + self.cur_movies[0] + "\".\n"
+                else:
+                    response = "So you "
+                    if sentiment > 0:
+                        response += "liked"
+                    else:
+                        response += "didn't like"
+                    response += " \"" + self.cur_movies[0] + "\", bro. "
+                    response_end_options = [
+                        "I hear you. ", "Got it. ", "Nailed it. "]
+                    response = random.choice(response_end_options)
+
+                # ex: "I was blown away by "Titanic (1997)"" -> "You liked "Titanic""
+                # >have a few response options and randomize between them)
+                # ex: "great, dude, you [sentiment] [movie]."
+                if len(self.movie_memory_input) == self.movie_input_threshold:
+                    self.recommendation_indices = self.recommend(
+                        self.user_ratings, self.ratings, self.k, False)
+                    self.cur_recommend_index = 0
+                    self.recommend_yesno = True
+                    response += "I know everything I need to now, bro. What some sweet recs?"
+                    return response
+                else:
+                    response_options = [
+                        "Give me some more info, man.", "Let's keep this party rolling. More prefs?"]
+                    response += random.choice(response_options)
+                    return response
+
             response = "I processed {} in starter mode!!".format(line)
 
         #############################################################################
@@ -169,14 +592,15 @@ class Chatbot:
         of all movie titles you've extracted from the text.
 
         Example:
-          potential_titles = chatbot.extract_titles(
-              chatbot.preprocess('I liked "The Notebook" a lot.'))
-          print(potential_titles) // prints ["The Notebook"]
+        potential_titles = chatbot.extract_titles(chatbot.preprocess('I liked "The Notebook" a lot.'))
+        print(potential_titles) // prints ["The Notebook"]
 
         :param preprocessed_input: a user-supplied line of text that has been pre-processed with preprocess()
         :returns: list of movie titles that are potentially in the text
         """
         titles = []
+
+        phrase_length = {}
 
         if self.creative:
 
@@ -216,16 +640,95 @@ class Chatbot:
 
                         break
 
-                # word_tokens = word_tokenize(s) THEN CUT WORDS FROM EACH END
-
                 pattern = '(?:[\W|^])' + \
                     re.escape(movie_title_use) + '(?:[\W|$])'
 
                 if re.findall(pattern, preprocessed_input_lc) != []:
                     titles.append(movie_title_use)
 
-                # GO FROM EITHER SIDE OF MOVIE, TAKE OFF PIECE AT A TIME
-                # WOULDN'T NEED EXTRA ARTICLE PROCESSING
+            if len(titles) != 0:
+                return titles
+
+            else:  # Run other method!
+
+                preprocessed_input_lc = preprocessed_input.lower()
+
+                sentence = nltk.word_tokenize(preprocessed_input_lc)
+
+                for first_word in range(0, (len(sentence))):
+
+                    for last_word in range(first_word + 1, len(sentence) + 1):
+
+                        og_phrase = sentence[first_word:last_word]
+
+                        phrase = " ".join(og_phrase)
+
+                        # POS_tag all nouns??
+                        if phrase in [":", ",", "'", "\.", "!", "i", "the", "a", "an", "\(", "\)", "and", "all the", "i want", "you are"]:
+                            continue
+
+                        phrase = '(?:\W|^)' + re.escape(phrase) + '(?:\W|$)'
+
+                        for i in range(len(self.titles)):
+
+                            movie_title = self.titles[i][0]
+
+                            # get everything before (
+                            movie_title_edited = re.findall(
+                                '(.*) \([0-9]{4}\)', movie_title)
+
+                            if len(movie_title_edited) != 0:
+                                movie_title_edited = movie_title_edited[0]
+
+                            else:
+                                movie_title_edited = movie_title
+
+                            movie_title_lc = movie_title_edited.lower()
+
+                            movie_title_use = movie_title_lc
+
+                            articles = ['the', 'an', 'a']
+
+                            for article in articles:
+
+                                pattern = ', ' + article + '(?:\W|$)'
+
+                                if re.findall(pattern, movie_title_lc) != []:
+
+                                    suffix = ', ' + article
+
+                                    movie_title_use = re.sub(
+                                        suffix, "", movie_title_use)  # space??
+                                    movie_title_use = article + ' ' + movie_title_use
+
+                                    break
+
+                            if re.findall(phrase, movie_title_use) != []:
+                                if len(og_phrase) not in phrase_length:
+                                    phrase_length[len(og_phrase)] = list()
+                                phrase_length[len(og_phrase)].append(
+                                    movie_title_use)
+
+                if not phrase_length:
+                    return []
+
+                else:
+
+                    top_movies = phrase_length[max(phrase_length)]
+                    # print(top_movies)
+                    first_movie = nltk.word_tokenize(top_movies[0])
+                    # print(first_movie)
+                    first_word_first_movie = first_movie[0]
+                    # print(first_word_first_movie)
+
+                    for i in range(1, len(top_movies)):
+                        tokenized_movie = nltk.word_tokenize(top_movies[i])
+                        # print(tokenized_movie)
+                        # print(tokenized_movie[0])
+                        if tokenized_movie[0] != first_word_first_movie:
+                            return []
+
+                    return top_movies
 
         else:
             # FOR SENTIMENT!!
@@ -385,7 +888,6 @@ class Chatbot:
                 elif stemmed in self.sentiment:
                     score += self.sentiment[stemmed] * flag_neg
 
-        print(score)
         if score <= -10:
             return -2
         if score >= 10:
@@ -420,6 +922,7 @@ class Chatbot:
         flag_neg = 1
         line = preprocessed_input.lower()
 
+        # assuming correct titles in line
         titles = re.findall('"([^"]*)"', preprocessed_input)
 
         for t in titles:
